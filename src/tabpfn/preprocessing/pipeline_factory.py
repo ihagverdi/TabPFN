@@ -15,7 +15,7 @@ from tabpfn.preprocessing.steps import (
     DifferentiableZNormStep,
     EncodeCategoricalFeaturesStep,
     NanHandlingPolynomialFeaturesStep,
-    RemoveConstantFeaturesStep,
+    # RemoveConstantFeaturesStep,
     ReshapeFeatureDistributionsStep,
     ShuffleFeaturesStep,
 )
@@ -59,7 +59,7 @@ def create_preprocessing_pipeline(
             ),
         )
 
-    steps.append(RemoveConstantFeaturesStep())
+    # steps.append(RemoveConstantFeaturesStep())
 
     if pconfig.differentiable:
         steps.append(DifferentiableZNormStep())

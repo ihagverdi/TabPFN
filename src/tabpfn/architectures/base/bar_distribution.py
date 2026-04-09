@@ -60,46 +60,6 @@ class BarDistribution(nn.Module):
     def num_bars(self) -> int:
         return len(self.borders) - 1
 
-    def cdf(self, logits: torch.Tensor, ys: torch.Tensor) -> torch.Tensor:
-        """Calculates the cdf of the distribution described by the logits.
-        The cdf is scaled by the width of the bars.
-
-        Args:
-            logits:
-                tensor of shape (batch_size, ..., num_bars) with the logits describing
-                the distribution
-            ys:
-                tensor of shape (batch_size, ..., n_ys to eval) or (n_ys to eval)
-                with the targets.
-        """
-        if len(ys.shape) < len(logits.shape) and len(ys.shape) == 1:
-            # bring new borders to the same dim as logits up to the last dim
-            ys = ys.repeat((*logits.shape[:-1], 1))
-        else:
-            assert ys.shape[:-1] == logits.shape[:-1], (
-                f"ys.shape: {ys.shape} logits.shape: {logits.shape}"
-            )
-        probs = torch.softmax(logits, dim=-1)
-        buckets_of_ys = self.map_to_bucket_idx(ys).clamp(0, self.num_bars - 1)
-
-        prob_so_far = torch.cumsum(probs, dim=-1) - probs
-        prob_left_of_bucket = prob_so_far.gather(-1, buckets_of_ys)
-
-        share_of_bucket_left = (
-            (ys - self.borders[buckets_of_ys]) / self.bucket_widths[buckets_of_ys]
-        ).clamp(0.0, 1.0)
-        prob_in_bucket = probs.gather(-1, buckets_of_ys) * share_of_bucket_left
-
-        prob_left_of_ys = prob_left_of_bucket + prob_in_bucket
-
-        # just to fix numerical inaccuracies, if we had *exact* computation above we
-        # would not need the following:
-        prob_left_of_ys[ys <= self.borders[0]] = 0.0
-        prob_left_of_ys[ys >= self.borders[-1]] = 1.0
-        assert not torch.isnan(prob_left_of_ys).any()
-
-        return prob_left_of_ys.clip(0.0, 1.0)
-
     def get_probs_for_different_borders(
         self,
         logits: torch.Tensor,
@@ -491,45 +451,30 @@ class FullSupportBarDistribution(BarDistribution):
     def forward(
         self,
         logits: torch.Tensor,
-        y: torch.Tensor,
+        y: torch.Tensor, 
         mean_prediction_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Returns the negative log density (the _loss_).
-
-        y: T x B, logits: T x B x self.num_bars.
-
-        :param logits: Tensor of shape T x B x self.num_bars
-        :param y: Tensor of shape T x B
-        :param mean_prediction_logits:
-        :return:
         """
-        assert self.num_bars > 1
-        y = y.clone().view(*logits.shape[:-1])  # no trailing one dimension
-        ignore_loss_mask = self.ignore_init(y)  # alters y
-        target_sample = self.map_to_bucket_idx(y)  # shape: T x B (same as y)
-        target_sample.clamp_(0, self.num_bars - 1)
+        logits: shape (B, K) where K is the number of buckets
+        y: shape (B, O) where O is the number of observations per instance
+        returns: negative log density (the loss) of shape (B, O)
+        """
+        assert logits.shape[-1] == self.num_bars, f"mismatch between num_bars and logits_num_bars"
+        y = y.clone()
+        ignore_loss_mask = self.ignore_init(y)  # shape: (B, O)
+        target_sample =  self.map_to_bucket_idx(y)  # shape: (B, O) (same as y)
+        target_sample.clamp_(0,  self.num_bars - 1)  # bucket indices
 
-        assert logits.shape[-1] == self.num_bars, (
-            f"{logits.shape[-1]} vs {self.num_bars}"
-        )
-        assert (target_sample >= 0).all()
-        assert (target_sample < self.num_bars).all(), (
-            f"y {y} not in support set for borders (min_y, max_y) {self.borders}"
-        )
-        last_dim = logits.shape[-1]
-        assert last_dim == self.num_bars, f"{last_dim} vs {self.num_bars}"
-        # ignore all position with nan values
+        scaled_bucket_log_probs = self.compute_scaled_log_probs(logits)  # shape: (B, K)
 
-        scaled_bucket_log_probs = self.compute_scaled_log_probs(logits)
-
-        assert len(scaled_bucket_log_probs) == len(target_sample), (
-            len(scaled_bucket_log_probs),
-            len(target_sample),
+        assert scaled_bucket_log_probs.shape[0] == target_sample.shape[0], (
+            f"Shape mismatch: scaled_bucket_log_probs {scaled_bucket_log_probs.shape} vs target_sample {target_sample.shape}"
         )
+
         log_probs = scaled_bucket_log_probs.gather(
             -1,
-            target_sample.unsqueeze(-1),
-        ).squeeze(-1)
+            target_sample,
+        )  # shape: (B, O)
 
         side_normals = (
             self.halfnormal_with_p_weight_before(self.bucket_widths[0]),
@@ -537,46 +482,82 @@ class FullSupportBarDistribution(BarDistribution):
         )
 
         log_probs[target_sample == 0] += side_normals[0].log_prob(
-            (self.borders[1] - y[target_sample == 0]).clamp(min=0.00000001),
+            (self.borders[1] - y[target_sample == 0]).clamp(min=0.0)
         ) + torch.log(self.bucket_widths[0])
-        log_probs[target_sample == self.num_bars - 1] += side_normals[1].log_prob(
-            (y[target_sample == self.num_bars - 1] - self.borders[-2]).clamp(
-                min=0.00000001,
-            ),
-        ) + torch.log(self.bucket_widths[-1])
 
-        nll_loss = -log_probs
+        log_probs[target_sample == (self.num_bars - 1)] += side_normals[1].log_prob(
+            (y[target_sample == (self.num_bars - 1)] -  self.borders[-2]).clamp(min=0.0)) + torch.log(self.bucket_widths[-1])
 
-        if mean_prediction_logits is not None:  # TO BE REMOVED AFTER BO PAPER IS DONE
-            assert not ignore_loss_mask.any(), (
-                "Ignoring examples is not implemented with mean pred."
-            )
-            if not torch.is_grad_enabled():
-                pass
-            nll_loss = torch.cat(
-                (nll_loss, self.mean_loss(logits, mean_prediction_logits)),
-                0,
-            )
+        nllh = -log_probs
 
         if ignore_loss_mask.any():
-            nll_loss[ignore_loss_mask] = 0.0
+            nllh[ignore_loss_mask] = 0.0
 
-        # TODO: Check with samuel whether to keep
-        self.losses_per_bucket += (
-            torch.scatter(
-                self.losses_per_bucket,
-                0,
-                target_sample[~ignore_loss_mask].flatten(),
-                nll_loss[~ignore_loss_mask].flatten().detach(),
-            )
-            / target_sample[~ignore_loss_mask].numel()
-        )
-
-        return nll_loss
+        return nllh
 
     def pdf(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Probability density function at y."""
+        """
+        Probability density function at y.
+
+        logits: shape (B, K) where K is the number of buckets
+        y: shape (B, O) where O is the number of observations per instance
+
+        returns: density at y of shape (B, O)
+        """
         return torch.exp(-self.forward(logits, y))
+
+    def cdf(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        logits: shape (B, K) where K is the number of buckets
+        y: shape (B, O) where O is the number of observations per instance
+        returns: cdf of shape (B, O)
+        """
+        assert self.num_bars == logits.shape[-1], f"{self.num_bars} vs {logits.shape[-1]}"
+        assert logits.ndim == y.ndim and logits.shape[0] == y.shape[0], f"Batch size mismatch between logits and y: {logits.shape} vs {y.shape}"
+            
+        probs = torch.softmax(logits, dim=-1)  # shape: (B, K)
+        
+        buckets_of_ys = self.map_to_bucket_idx(y).clamp(0, self.num_bars - 1)  # shape: (B, O)
+
+        prob_so_far = torch.cumsum(probs, dim=-1) - probs  # shape: (B, K), prob_so_far[:, k] is the total probability mass of all buckets to the left of bucket k.
+
+        # Ensure gather works across matching dimensions
+        assert buckets_of_ys.ndim == prob_so_far.ndim
+        prob_left_of_bucket = prob_so_far.gather(-1, buckets_of_ys)  # shape: (B, O)
+
+        # 1. Default Assumption: Uniform Interpolation (valid for middle buckets)
+        share_of_bucket_left = (
+            (y - self.borders[buckets_of_ys]) / self.bucket_widths[buckets_of_ys]
+        ).clamp(0.0, 1.0)  # shape: (B, O)
+
+        # 2. Correction for the Left-most Bucket (Half-Normal extending to -infinity)
+        hn_left = self.halfnormal_with_p_weight_before(self.bucket_widths[0])
+        is_left_bucket = (buckets_of_ys == 0)
+        
+        if is_left_bucket.any():
+            # The left half-normal originates at borders[1] and decays to the left.
+            dist_from_right_edge = (self.borders[1] - y[is_left_bucket]).clamp(min=0.0)
+            
+            # The integral from -inf up to 'y' of a reversed half-normal 
+            # is equal to 1.0 minus the standard Half-Normal CDF.
+            share_of_bucket_left[is_left_bucket] = 1.0 - hn_left.cdf(dist_from_right_edge)
+
+        # 3. Correction for the Right-most Bucket (Half-Normal extending to +infinity)
+        hn_right = self.halfnormal_with_p_weight_before(self.bucket_widths[-1])
+        is_right_bucket = (buckets_of_ys == self.num_bars - 1)
+        
+        if is_right_bucket.any():
+            # The right half-normal originates at borders[-2] and decays to the right.
+            dist_from_left_edge = (y[is_right_bucket] - self.borders[-2]).clamp(min=0.0)
+            
+            # The integral from borders[-2] up to 'y' is just the standard CDF.
+            share_of_bucket_left[is_right_bucket] = hn_right.cdf(dist_from_left_edge)
+
+        # 4. Final Aggregation
+        prob_in_bucket = probs.gather(-1, buckets_of_ys) * share_of_bucket_left  # shape: (B, O)
+
+        total_prob_ys = prob_left_of_bucket + prob_in_bucket
+        return total_prob_ys.clip(0.0, 1.0)
 
     def sample(self, logits: torch.Tensor, t: float = 1.0) -> torch.Tensor:
         """Samples values from the distribution.
