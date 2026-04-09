@@ -439,11 +439,11 @@ class FullSupportBarDistribution(BarDistribution):
 
     @staticmethod
     def halfnormal_with_p_weight_before(
-        range_max: float,
+        range_max: torch.Tensor,
         p: float = 0.5,
     ) -> torch.distributions.HalfNormal:
-        s = range_max / torch.distributions.HalfNormal(torch.tensor(1.0)).icdf(
-            torch.tensor(p),
+        s = range_max / torch.distributions.HalfNormal(torch.tensor(1.0, device=range_max.device)).icdf(
+            torch.tensor(p, device=range_max.device),
         )
         return torch.distributions.HalfNormal(s)
 
