@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 from __future__ import annotations
 
 import io
@@ -13,11 +15,13 @@ import sklearn.datasets
 import torch
 from sklearn import config_context
 from sklearn.base import check_is_fitted
+from sklearn.metrics import r2_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.estimator_checks import parametrize_with_checks
 from torch import nn
 
+import tabpfn.regressor as regressor_module
 from tabpfn import TabPFNRegressor
 from tabpfn.base import RegressorModelSpecs, initialize_tabpfn_model
 from tabpfn.constants import ModelVersion
@@ -36,8 +40,61 @@ from .utils import (
 devices = get_pytest_devices()
 
 
-model_sources = [ModelSource.get_regressor_v2(), ModelSource.get_regressor_v2_5()]
+model_sources = [
+    ModelSource.get_regressor_v2(),
+    ModelSource.get_regressor_v2_5(),
+    ModelSource.get_regressor_v3(),
+]
 fit_modes = ["low_memory", "fit_preprocessors"]
+
+
+def test__show_progress_bar__is_configurable() -> None:
+    model = TabPFNRegressor(show_progress_bar=True)
+    assert model.show_progress_bar is True
+    assert model.get_params()["show_progress_bar"] is True
+
+    default_model = TabPFNRegressor()
+    assert default_model.show_progress_bar is False
+    assert default_model.get_params()["show_progress_bar"] is False
+
+
+def test__predict__show_progress_bar_true__tiny_dataset_does_not_crash() -> None:
+    model = TabPFNRegressor(n_estimators=1, show_progress_bar=True, random_state=42)
+    X, y = sklearn.datasets.make_regression(
+        n_samples=9,
+        n_features=3,
+        random_state=0,
+        coef=False,
+    )
+
+    model.fit(X, y)
+
+    predictions = model.predict(X)
+
+    assert predictions.shape == (X.shape[0],)
+
+
+def test__forward__passes_progress_bar_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = TabPFNRegressor(n_estimators=1, show_progress_bar=True, random_state=42)
+    X, y = sklearn.datasets.make_regression(
+        n_samples=9, n_features=3, random_state=0, coef=False
+    )
+    model.fit(X, y)
+
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_tqdm(iterable, **kwargs) -> typing.Iterable[object]:
+        captured_kwargs.update(kwargs)
+        return iterable
+
+    monkeypatch.setattr(regressor_module, "tqdm", fake_tqdm)
+
+    averaged_logits, outputs, borders = model.forward(X, use_inference_mode=True)
+
+    assert averaged_logits is not None
+    assert outputs
+    assert borders
+    assert captured_kwargs["disable"] is False
 
 
 @pytest.fixture(scope="module")
@@ -226,28 +283,77 @@ def test__fit_predict__specify_inference_config__outputs_correct_shape(
     assert model.predict(X).shape == (X.shape[0],)
 
 
-# The different fitting modes manage the random state differently.
-@pytest.mark.skip(
-    reason="The prediction is actually different depending on the fitting mode."
+@pytest.mark.parametrize(
+    "model_version", [ModelVersion.V2, ModelVersion.V2_5, ModelVersion.V3]
 )
-def test_fit_modes_all_return_equal_results(X_y: tuple[np.ndarray, np.ndarray]) -> None:
+# Disable MPS as it doesn't support float64.
+@pytest.mark.parametrize("device", [d for d in get_pytest_devices() if d != "mps"])
+def test__fit_preprocessors_and_with_cache_produce_equal_results(
+    X_y: tuple[np.ndarray, np.ndarray], model_version: ModelVersion, device: str
+) -> None:
     kwargs = {
-        "n_estimators": 10,
-        "device": "cpu",
-        "inference_precision": torch.float32,
+        "version": model_version,
+        "n_estimators": 2,
+        "inference_precision": torch.float64,
         "random_state": 0,
+        "device": device,
     }
     X, y = X_y
 
     torch.random.manual_seed(0)
-    tabpfn = TabPFNRegressor(fit_mode="fit_preprocessors", **kwargs)
+    tabpfn = TabPFNRegressor.create_default_for_version(
+        fit_mode="fit_preprocessors", **kwargs
+    )
     tabpfn.fit(X, y)
     preds = tabpfn.predict(X)
 
     torch.random.manual_seed(0)
-    tabpfn = TabPFNRegressor(fit_mode="low_memory", **kwargs)
+    tabpfn = TabPFNRegressor.create_default_for_version(
+        fit_mode="fit_with_cache", **kwargs
+    )
+    tabpfn.fit(X, y)
+    np.testing.assert_array_almost_equal(preds, tabpfn.predict(X), decimal=2)
+
+
+@pytest.mark.parametrize("model_version", list(ModelVersion))
+# Disable MPS as it doesn't support float64.
+@pytest.mark.parametrize("device", [d for d in get_pytest_devices() if d != "mps"])
+def test__fit_preprocessors_and_low_memory_produce_equal_results(
+    X_y: tuple[np.ndarray, np.ndarray], model_version: ModelVersion, device: str
+) -> None:
+    kwargs = {
+        "version": model_version,
+        "n_estimators": 2,
+        "inference_precision": torch.float64,
+        "random_state": 0,
+        "device": device,
+    }
+    X, y = X_y
+
+    torch.random.manual_seed(0)
+    tabpfn = TabPFNRegressor.create_default_for_version(
+        fit_mode="fit_preprocessors", **kwargs
+    )
+    tabpfn.fit(X, y)
+    preds = tabpfn.predict(X)
+
+    torch.random.manual_seed(0)
+    tabpfn = TabPFNRegressor.create_default_for_version(fit_mode="low_memory", **kwargs)
     tabpfn.fit(X, y)
     np.testing.assert_array_almost_equal(preds, tabpfn.predict(X))
+
+
+@pytest.mark.parametrize("model_version", list(ModelVersion))
+def test__fit_and_predict__on_demo_dataset__r2_reasonable(
+    model_version: ModelVersion,
+) -> None:
+    X, y = sklearn.datasets.make_friedman1(n_samples=200, noise=0.1, random_state=0)
+    model = TabPFNRegressor.create_default_for_version(
+        version=model_version, random_state=0
+    )
+    model.fit(X, y)
+    r2 = r2_score(y, model.predict(X))
+    assert r2 > 0.95
 
 
 def test_multiple_models_predict_different_results(
@@ -496,7 +602,7 @@ def test_get_embeddings(
 
     # Need to access the model through the executor
     model_instance = next(iter(model.executor_.model_caches[0]._models.values()))
-    hidden_size = model_instance.ninp
+    hidden_size = model_instance.embedding_dim
 
     assert isinstance(embeddings, np.ndarray)
     assert embeddings.shape[0] == n_estimators
@@ -849,6 +955,17 @@ def test__create_default_for_version__v2_6__uses_correct_defaults() -> None:
     assert isinstance(estimator.model_path, str)
     assert "regressor" in estimator.model_path
     assert "-v2.6-" in estimator.model_path
+
+
+def test__create_default_for_version__v3__uses_correct_defaults() -> None:
+    estimator = TabPFNRegressor.create_default_for_version(ModelVersion.V3)
+
+    assert isinstance(estimator, TabPFNRegressor)
+    assert estimator.n_estimators == 8
+    assert estimator.softmax_temperature == 0.9
+    assert isinstance(estimator.model_path, str)
+    assert "regressor" in estimator.model_path
+    assert "-v3-" in estimator.model_path
 
 
 def test__create_default_for_version__passes_through_overrides() -> None:
