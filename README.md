@@ -5,9 +5,11 @@
 [![Discord](https://img.shields.io/discord/1285598202732482621?color=7289da&label=Discord&logo=discord&logoColor=ffffff)](https://discord.gg/BHnX2Ptf4j)
 [![Documentation](https://img.shields.io/badge/docs-priorlabs.ai-blue)](https://priorlabs.ai/docs)
 [![colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/PriorLabs/TabPFN/blob/main/examples/notebooks/TabPFN_Demo_Local.ipynb)
-[![Python Versions](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://pypi.org/project/tabpfn/)
+[![Python Versions](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://pypi.org/project/tabpfn/)
 
-<img src="https://github.com/PriorLabs/tabpfn-extensions/blob/main/tabpfn_summary.webp" width="80%" alt="TabPFN Summary">
+<img src="docs/assets/tabpfn_architecture.svg" width="100%" alt="TabPFN trains on synthetic datasets and predicts on unseen real-world datasets in a single forward pass">
+
+<img src="docs/assets/tabpfn_attention.svg" width="100%" alt="TabPFN-3.5 architecture: a distribution embedder, then row-wise and cross-row attention, read out as per-row tokens">
 
 ## Quick Start
 
@@ -22,20 +24,27 @@
 ```bash
 pip install tabpfn
 ```
-
-Note: For best performance on Apple Silicon/MPS, consider installing a pytorch version after
-the nightly "2.13.0.dev20260510". This enables flash attention without relying on MLX
-(the latter requires a GPU-CPU-GPU roundtrip).
-
-
-### Basic Usage
+TabPFN supports Python 3.10+.
 
 > ⚡ **GPU Recommended**:
 > For optimal performance, use a GPU (even older ones with ~8GB VRAM work well; 16GB needed for some large datasets).
-> On CPU, only small datasets (≲1000 samples) are feasible.
+> On CPU, only moderate datasets are feasible (TabPFN-3 and TabPFN-3.5 allow up to 5000 samples; older versions up to 1000).
 > No GPU? Use our free hosted inference via [TabPFN Client](https://github.com/PriorLabs/tabpfn-client).
 
-To use our default TabPFN-3 model:
+**On macOS:** GPU support is automatically included for Apple Silicon Macs. For best performance, ensure you are using PyTorch 2.13 or newer (see [#949](https://github.com/PriorLabs/TabPFN/pull/949)).
+
+**On Linux:** Nvidia GPU support is automatically included. For AMD GPUs, first [install PyTorch with ROCm](https://pytorch.org/get-started/locally/), then install TabPFN. For example,
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
+pip install tabpfn
+```
+For a CPU-only install, first [install CPU-only PyTorch](https://pytorch.org/get-started/locally/), then install TabPFN. This saves disk space if you do not have a GPU.
+
+**On Windows:** For Nvidia GPUs, [install PyTorch with CUDA](https://pytorch.org/get-started/locally/), then install TabPFN. For AMD GPUs, [install PyTorch with ROCm](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/windows/install-pytorch.html), then install TabPFN.
+
+
+### Basic Usage
+To use our default TabPFN-3.5 model:
 
 ```python
 from tabpfn import TabPFNClassifier, TabPFNRegressor
@@ -49,15 +58,23 @@ reg.fit(X_train, y_train)  # downloads checkpoint on first use
 predictions = reg.predict(X_test)
 ```
 
-To use other model versions (e.g. the previous default, TabPFN-2.6):
+
+To use the smaller, faster TabPFN-3.5-Fast you can use `ModelVersion.V3_5_FAST` or "v3.5-fast".
 
 ```python
-from tabpfn import TabPFNClassifier, TabPFNRegressor
 from tabpfn.constants import ModelVersion
 
-classifier = TabPFNClassifier.create_default_for_version(ModelVersion.V2_6)
-regressor = TabPFNRegressor.create_default_for_version(ModelVersion.V2_6)
+classifier = TabPFNClassifier.create_default_for_version(ModelVersion.V3_5_FAST)
+regressor = TabPFNRegressor.create_default_for_version(ModelVersion.V3_5_FAST)
 ```
+
+To use other model versions (e.g. the previous default, TabPFN-3):
+
+```python
+classifier = TabPFNClassifier.create_default_for_version(ModelVersion.V3)
+regressor = TabPFNRegressor.create_default_for_version(ModelVersion.V3)
+```
+
 
 For complete examples, see the [tabpfn_for_binary_classification.py](https://github.com/PriorLabs/TabPFN/tree/main/examples/tabpfn_for_binary_classification.py), [tabpfn_for_multiclass_classification.py](https://github.com/PriorLabs/TabPFN/tree/main/examples/tabpfn_for_multiclass_classification.py), and [tabpfn_for_regression.py](https://github.com/PriorLabs/TabPFN/tree/main/examples/tabpfn_for_regression.py) files.
 
@@ -73,7 +90,7 @@ Choose the right TabPFN implementation for your needs:
 
   -  **`interpretability`**: Gain insights with SHAP-based explanations, feature importance, and selection tools.
   -  **`unsupervised`**: Tools for outlier detection and synthetic tabular data generation.
-  -  **`embeddings`**: Extract and use TabPFN’s internal learned embeddings for downstream tasks or analysis.
+  -  **`embeddings`**: Extract and use TabPFN's internal learned embeddings for downstream tasks or analysis.
   -  **`many_class`**: Handle multi-class classification problems that exceed TabPFN's built-in class limit.
 
   To install:
@@ -89,11 +106,16 @@ Choose the right TabPFN implementation for your needs:
 
 ## License
 
-The TabPFN-2.5, TabPFN-2.6, and TabPFN-3 model weights are released under non-commercial licenses (TabPFN-3 [license](https://huggingface.co/Prior-Labs/tabpfn_3/blob/main/LICENSE); see the [Models page](https://docs.priorlabs.ai/models#tabpfn-model-license) for prior releases). TabPFN-3 is used by default.
+The code in this repository is licensed under the [Apache License 2.0](LICENSE). Third-party code is subject to its own licenses and attribution requirements; see [Third-Party Notices](THIRD-PARTY-NOTICES.md).
 
-The code and TabPFN-2 model weights are licensed under Prior Labs License (Apache 2.0 with additional attribution requirement): [here](LICENSE). To use the v2 model weights, instantiate your model as follows:
+Model weights are licensed separately.
 
-```
+The TabPFN-2.5, TabPFN-2.6, TabPFN-3 and TabPFN-3.5 model weights are released under non-commercial licenses (TabPFN-3.5 [license](https://huggingface.co/Prior-Labs/tabpfn_3_5/blob/main/LICENSE), TabPFN-3 [license](https://huggingface.co/Prior-Labs/tabpfn_3/blob/main/LICENSE); see the [Models page](https://docs.priorlabs.ai/models#tabpfn-model-license) for prior releases). TabPFN-3.5 is used by default.
+
+The TabPFN-2 model weights are licensed under the Prior Labs License (Apache 2.0 with an additional attribution requirement): [classifier license](https://huggingface.co/Prior-Labs/TabPFN-v2-clf/blob/main/LICENSE.txt), [regressor license](https://huggingface.co/Prior-Labs/TabPFN-v2-reg/blob/main/LICENSE.txt). To use the v2 model weights, instantiate your model as follows:
+
+```python
+from tabpfn import TabPFNRegressor
 from tabpfn.constants import ModelVersion
 
 tabpfn_v2 = TabPFNRegressor.create_default_for_version(ModelVersion.V2)
@@ -133,12 +155,22 @@ We're building the future of tabular machine learning and would love your involv
 
 ## Citation
 
-You can read our paper explaining TabPFNv2 [here](https://doi.org/10.1038/s41586-024-08328-6), and the model report of TabPFN-2.5 [here](https://arxiv.org/abs/2511.08667).
+You can read our paper explaining TabPFNv2 [here](https://doi.org/10.1038/s41586-024-08328-6), and model reports for [TabPFN-2.5](https://arxiv.org/abs/2511.08667) and [TabPFN-3](https://arxiv.org/abs/2605.13986).
 
 <details>
 <summary><b>BibTeX</b></summary>
 
 ```bibtex
+@misc{grinsztajn2026tabpfn3technicalreport,
+      title={TabPFN-3: Technical Report}, 
+      author={Léo Grinsztajn and Klemens Flöge and Oscar Key and Felix Birkel and Philipp Jund and Brendan Roof and Mihir Manium and Shi Bin Hoo and Magnus Bühler and Anurag Garg and Dominik Safaric and Jake Robertson and Benjamin Jäger and Simone Alessi and Adrian Hayler and Vladyslav Moroshan and Lennart Purucker and Philipp Singer and Alan Arazi and Julien Siems and Jan Hendrik Metzen and Georg Grab and Nick Erickson and Siyuan Guo and Eliott Kalfon and Simon Bing and David Salinas and Clara Cornu and Lilly Charlotte Wehrhahn and Diana Kriuchkova and Kursat Kaya and Lydia Sidhoum and Marie Salmon and Jerry Chen and Madelon Hulsebos and Yann LeCun and Samuel Müller and Bernhard Schölkopf and Sauraj Gambhir and Noah Hollmann and Frank Hutter},
+      year={2026},
+      eprint={2605.13986},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2605.13986}, 
+}
+
 @misc{grinsztajn2025tabpfn,
   title={TabPFN-2.5: Advancing the State of the Art in Tabular Foundation Models},
   author={Léo Grinsztajn and Klemens Flöge and Oscar Key and Felix Birkel and Philipp Jund and Brendan Roof and
@@ -183,7 +215,7 @@ You can read our paper explaining TabPFNv2 [here](https://doi.org/10.1038/s41586
 - **Use batch prediction mode**: Each `predict` call recomputes the training set. Calling `predict` on 100 samples separately is almost 100 times slower and more expensive than a single call. If the test set is very large, split it into chunks of 1000 samples each.
 - **Avoid data preprocessing**: Do not apply data scaling or one-hot encoding when feeding data to the model.
 - **Use a GPU**: TabPFN is slow to execute on a CPU. Ensure a GPU is available for better performance.
-- **Mind the dataset size**: TabPFN works best on datasets within its recommended size limits. The current default (**TabPFN-3**) supports up to **1,000,000 × 200**, **100,000 × 2,000**, or **1,000 × 20,000** (rows × features) — larger feature counts trade off against row capacity. See the [Models page](https://docs.priorlabs.ai/models) for the limits of other checkpoints.
+- **Mind the dataset size**: TabPFN works best on datasets within its recommended size limits. **TabPFN-3.5** and **TabPFN-3.5-Fast** accept up to **1,000,000 rows** and **20,000 features**. See the [Models page](https://docs.priorlabs.ai/models) for the limits of other checkpoints.
 
 ## ❓ FAQ
 
@@ -192,21 +224,21 @@ You can read our paper explaining TabPFNv2 [here](https://doi.org/10.1038/s41586
 <details>
 <summary><b>Q: What dataset sizes work best with TabPFN?</b></summary>
 
-Recommended row and feature limits vary by checkpoint — see the [Models page](https://docs.priorlabs.ai/models) for the per-release limits. As a quick reference, the current default (**TabPFN-3**) supports up to **1,000,000 × 200**, **100,000 × 2,000**, or **1,000 × 20,000** (rows × features); larger feature counts trade off against row capacity. The previous default (**TabPFN-2.6**) is recommended for up to **100,000 rows** and **2,000 features**. If your dataset exceeds the recommended limits for your checkpoint, you can subsample, set `ignore_pretraining_limits=True` to push past the size guardrail, or upgrade to a release with a higher limit.
+Recommended row and feature limits vary by checkpoint — see the [Models page](https://docs.priorlabs.ai/models) for the per-release limits. As a quick reference, the current default (**TabPFN-3.5**, and **TabPFN-3.5-Fast**) accepts up to **1,000,000 rows** and **20,000 features**. If your dataset exceeds the recommended limits for your checkpoint, you can subsample, set `ignore_pretraining_limits=True` to push past the size guardrail, or upgrade to a release with a higher limit.
 
 </details>
 
 <details>
-<summary><b>Q: Why can't I use TabPFN with Python 3.8?</b></summary>
+<summary><b>Q: Why can't I use TabPFN with Python 3.9?</b></summary>
 
-TabPFN requires **Python 3.9+** due to newer language features. Compatible versions: **3.9, 3.10, 3.11, 3.12, 3.13**.
+TabPFN requires **Python 3.10+** due to newer language features. Compatible versions: **3.10, 3.11, 3.12, 3.13, 3.14**.
 
 </details>
 
 ### **Installation & Setup**
 
 <details>
-<summary><b>Q: How do I get access to TabPFN-2.5 / TabPFN-2.6 / TabPFN-3?</b></summary>
+<summary><b>Q: How do I get access to TabPFN-2.5 / TabPFN-2.6 / TabPFN-3 / TabPFN-3.5?</b></summary>
 
 On first use, TabPFN will automatically open a browser window where you can log in via [PriorLabs](https://ux.priorlabs.ai) and accept the license terms. Your authentication token is cached locally so you only need to do this once.
 
@@ -235,8 +267,8 @@ This script will download the main classifier and regressor models, as well as a
 **Manual Download**
 
 1. Download the model files manually from HuggingFace:
-   - Classifier: [tabpfn-v3-classifier-20260506.ckpt](https://huggingface.co/Prior-Labs/tabpfn_3/blob/main/tabpfn-v3-classifier-20260506.ckpt)
-   - Regressor: [tabpfn-v3-regressor-20260506.ckpt](https://huggingface.co/Prior-Labs/tabpfn_3/blob/main/tabpfn-v3-regressor-20260506.ckpt)
+   - TabPFN-3.5 (one file serves both classifier and regressor): [tabpfn-v3.5-20260909.safetensors](https://huggingface.co/Prior-Labs/tabpfn_3_5/blob/main/tabpfn-v3.5-20260909.safetensors)
+   - TabPFN-3.5-Fast: [tabpfn-v3.5-fast-20260909.safetensors](https://huggingface.co/Prior-Labs/tabpfn_3_5/blob/main/tabpfn-v3.5-fast-20260909.safetensors)
 
 2. Place the file in one of these locations:
    - Specify directly: `TabPFNClassifier(model_path="/path/to/model.ckpt")`
@@ -268,10 +300,13 @@ TabPFN uses Pydantic settings for configuration, supporting environment variable
 
 **Model Configuration:**
 - `TABPFN_MODEL_CACHE_DIR`: Custom directory for caching downloaded TabPFN models (default: platform-specific user cache directory)
-- `TABPFN_ALLOW_CPU_LARGE_DATASET`: Allow running TabPFN on CPU with large datasets (>1000 samples). Set to `true` to override the CPU limitation. Note: This will be very slow!
+- `TABPFN_ALLOW_CPU_LARGE_DATASET`: Allow running TabPFN on CPU above the per-model sample limit (5000 for TabPFN-3 and TabPFN-3.5, 1000 for older versions). Set to `true` to override the CPU limitation. Note: large datasets can still be slow on CPU!
+- `TABPFN_MPS_MEMORY_FRACTION`: Fraction of recommended max MPS memory to allow on Apple Silicon (default: `0.7`). Used to prevent macOS system crashes; set before importing TabPFN. Values above `1.0` are not recommended.
+- `TABPFN_MAX_BATCHED_TEST_ROWS`: Maximum number of test rows fed through the model in a single forward pass during cached (`fit_mode="fit_with_cache"`) inference (default: `32768`). Larger test sets are split into independent chunks of at most this size and concatenated, bounding peak memory. Test rows are conditionally independent given the KV cache, so chunking is mathematically equivalent — results may still differ slightly due to floating-point non-associativity (see [#800](https://github.com/PriorLabs/TabPFN/issues/800#issuecomment-4903444425)). Performance should be close to optimal at the default of `32768`: the hardware is already saturated at that chunk size and, since the computations are independent, larger chunks bring no speedup. Set to `0` to disable chunking.
 
 **PyTorch Settings:**
 - `PYTORCH_CUDA_ALLOC_CONF`: PyTorch CUDA memory allocation configuration to optimize GPU memory usage (default: `max_split_size_mb:512`). See [PyTorch CUDA documentation](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf) for more information.
+- If you experience crashes on Windows with the error message containing `Windows fatal exception: code 0xc000001d`, try to set `ONEDNN_MAX_CPU_ISA=AVX512_CORE_FP16`. This is likely an upstream pytorch/oneDNN bug.
 
 Example:
 ```bash
@@ -287,9 +322,9 @@ Or simply set them in your `.env`
 <details>
 <summary><b>Q: How do I save and load a trained TabPFN model?</b></summary>
 
-Use :func:`save_fitted_tabpfn_model` to persist a fitted estimator and reload
-it later with :func:`load_fitted_tabpfn_model` (or the corresponding
-``load_from_fit_state`` class methods).
+Use `save_fitted_tabpfn_model` to persist a fitted estimator and reload
+it later with `load_fitted_tabpfn_model` (or the corresponding
+`load_from_fit_state` class methods).
 
 ```python
 from tabpfn import TabPFNRegressor
@@ -303,12 +338,13 @@ reg = TabPFNRegressor(device="cuda")
 reg.fit(X_train, y_train)
 save_fitted_tabpfn_model(reg, "my_reg.tabpfn_fit")
 
-# Later or on a CPU-only machine
-reg_cpu = load_fitted_tabpfn_model("my_reg.tabpfn_fit", device="cpu")
+# Later, or in another process. Defaults to device="auto", as the
+# constructors do; pass device= to pin it (e.g. device="cpu").
+reg_loaded = load_fitted_tabpfn_model("my_reg.tabpfn_fit")
 ```
 
 To store just the foundation model weights (without a fitted estimator) use
-``save_tabpfn_model(reg.model_, "my_tabpfn.ckpt")``. This merely saves a
+``save_tabpfn_model(reg, "my_tabpfn.ckpt")`` (imported from ``tabpfn.model_loading``). This merely saves a
 checkpoint of the pre-trained weights so you can later create and fit a fresh
 estimator. Reload the checkpoint with ``load_model_criterion_config``.
 
@@ -339,27 +375,10 @@ Not effective:
 <details>
 <summary><b>Q: What are the different checkpoints on <a href="https://huggingface.co/Prior-Labs">Hugging Face</a>?</b></summary>
 
-Each TabPFN release publishes a default classification and regression checkpoint. Some releases also publish a handful of experimental variants — these aren't guaranteed to exist for every release. We recommend starting with the defaults; the variants are experimental and worse on average. When present, they can be used as part of an ensembling or hyperparameter optimization system, or tried out manually. Their name suffixes refer to what we expect them to be good at.
+Each TabPFN release publishes a default checkpoint: one classification and one regression checkpoint up to TabPFN-3, and from TabPFN-3.5 on a single multitask checkpoint that serves both. Some releases also publish a handful of experimental variants — these aren't guaranteed to exist for every release. We recommend starting with the defaults; the variants are experimental and worse on average. When present, they can be used as part of an ensembling or hyperparameter optimization system, or tried out manually. Their name suffixes refer to what we expect them to be good at.
 
 </details>
 
-## Anonymized Telemetry
-
-This project collects fully anonymous usage telemetry disabled by default.
-
-The data is used exclusively to help us provide stability to the relevant products and compute environments and guide future improvements.
-
-- **No personal data is collected**
-- **No code, model inputs, or outputs are ever sent**
-- **Data is strictly anonymous and cannot be linked to individuals**
-
-For details on telemetry, please see our [Telemetry Reference](https://github.com/PriorLabs/TabPFN/blob/main/TELEMETRY.md) and our [Privacy Policy](https://priorlabs.ai/privacy-policy/).
-
-**To opt in**, set the following environment variable:
-
-```bash
-export TABPFN_DISABLE_TELEMETRY=0
-```
 ---
 
 Built with ❤️ by [Prior Labs](https://priorlabs.ai) - Copyright (c) 2026 Prior Labs GmbH

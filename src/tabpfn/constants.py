@@ -9,8 +9,7 @@ from __future__ import annotations
 
 import pathlib
 from enum import Enum
-from typing import Any, Literal, Union
-from typing_extensions import TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import joblib
 import numpy as np
@@ -19,13 +18,14 @@ from packaging import version
 TaskType: TypeAlias = Literal["multiclass", "regression"]
 TaskTypeValues: tuple[TaskType, ...] = ("multiclass", "regression")
 
+MemorySavingMode: TypeAlias = bool | Literal["auto"] | float | int
+DEFAULT_SAVE_PEAK_MEMORY_FACTOR = 8
+
+
 XType: TypeAlias = Any
 YType: TypeAlias = Any
 
-SampleWeightType: TypeAlias = Any
-TODO_TYPE1: TypeAlias = str
-
-ModelPath: TypeAlias = Union[str, pathlib.Path]
+ModelPath: TypeAlias = str | pathlib.Path
 
 
 class ModelVersion(str, Enum):
@@ -35,6 +35,8 @@ class ModelVersion(str, Enum):
     V2_5 = "v2.5"
     V2_6 = "v2.6"
     V3 = "v3"
+    V3_5 = "v3.5"
+    V3_5_FAST = "v3.5-fast"
 
 
 NA_PLACEHOLDER = "__MISSING__"

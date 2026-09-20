@@ -10,6 +10,7 @@ from dataclasses import asdict
 from typing import Any, Literal, Protocol, overload
 from typing_extensions import override
 
+import torch
 from pydantic.dataclasses import dataclass
 from torch import Tensor, nn
 
@@ -106,6 +107,14 @@ class PerformanceOptions:
     result in longer inference time for the first forward pass, during which
     compile and autotune will be run. Tuning results are cached, so should
     persist across runs."""
+
+    kv_cache_dtype: torch.dtype | None = None
+    """Quantize each KV-cache layer to this dtype as it is constructed.
+
+    ``None`` keeps the model's compute dtype. Architectures that support explicit
+    KV-cache quantization can use this to avoid retaining a complete full-precision
+    cache before converting it to its storage dtype.
+    """
 
 
 class ArchitectureModule(Protocol):
@@ -233,6 +242,8 @@ class Architecture(nn.Module, ABC):
             standard decoder.
             Otherwise, a dictionary containing the output of each decoder, and also:
                 - "train_embeddings": The output of the encoder on the training data.
+                  Only present when the forward pass actually ran the training
+                  rows; a pass served from a `kv_cache` may omit it.
                 - "test_embeddings": The output of the encoder on the test data.
             Particular models may also return additional information.
         """
@@ -249,6 +260,15 @@ class Architecture(nn.Module, ABC):
             force_recompute_layer=False,
             use_chunkwise_inference=False,
         )
+
+    def get_supported_kv_cache_precisions(self) -> tuple[str, ...]:
+        """KV cache storage dtypes this architecture supports (``fit_with_cache``).
+
+        ``"auto"`` (keep the computed dtype) is always supported. Architectures
+        whose cache implements quantization override this to additionally list
+        e.g. ``"int8"``.
+        """
+        return ("auto",)
 
     @property
     @abstractmethod

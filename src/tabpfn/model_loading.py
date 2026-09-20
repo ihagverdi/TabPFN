@@ -7,7 +7,6 @@ from __future__ import annotations
 import contextlib
 import copy
 import functools
-import inspect
 import json
 import logging
 import os
@@ -17,28 +16,35 @@ import tempfile
 import urllib.request
 import warnings
 import zipfile
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, cast, overload
+from threading import Lock
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast, overload
 from urllib.error import URLError
 
 import joblib
 import torch
 from filelock import FileLock
-from tabpfn_common_utils.telemetry import set_model_config
 from torch import nn
 
 from tabpfn.architectures import ARCHITECTURES
-from tabpfn.architectures.base.bar_distribution import FullSupportBarDistribution
+from tabpfn.architectures.shared.bar_distribution import FullSupportBarDistribution
+from tabpfn.checkpoint import Checkpoint
 from tabpfn.constants import ModelVersion
 from tabpfn.errors import TabPFNHuggingFaceGatedRepoError
 from tabpfn.inference import InferenceEngine
-from tabpfn.inference_config import InferenceConfig
+from tabpfn.inference_config import (
+    InferenceConfig,
+    raise_if_checkpoints_disagree_on_overridable_fields,
+)
 from tabpfn.settings import settings
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from sklearn.base import BaseEstimator
 
     from tabpfn import TabPFNClassifier, TabPFNRegressor
@@ -46,6 +52,7 @@ if TYPE_CHECKING:
 if TYPE_CHECKING:
     from tabpfn.architectures.interface import Architecture, ArchitectureConfig
     from tabpfn.constants import ModelPath
+    from tabpfn.utils import DevicesSpecification
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +63,8 @@ FALLBACK_S3_BASE_URL = "https://storage.googleapis.com/tabpfn-v2-model-files/051
 V_2_5_IDENTIFIER = "v2.5"
 V_2_6_IDENTIFIER = "v2.6"
 V_3_IDENTIFIER = "v3"
+V_3_5_IDENTIFIER = "v3.5"
+V_3_5_FAST_IDENTIFIER = "v3.5-fast"
 
 
 class ModelType(str, Enum):  # noqa: D101
@@ -172,6 +181,7 @@ class ModelSource:  # noqa: D101
             "tabpfn-v3-classifier-v3_default.ckpt",
             "tabpfn-v3-classifier-v3_20260417_binary.ckpt",
             "tabpfn-v3-classifier-v3_20260417_multiclass.ckpt",
+            "tabpfn-v3-classifier-v3_20260506_ood.ckpt",
         ]
         return cls(
             repo_id="Prior-Labs/tabpfn_3",
@@ -185,6 +195,7 @@ class ModelSource:  # noqa: D101
             "tabpfn-v3-regressor-v3_default.ckpt",
             "tabpfn-v3-regressor-v3_20260417_mediumdata.ckpt",
             "tabpfn-v3-regressor-v3_20260506_timeseries.ckpt",
+            "tabpfn-v3-regressor-v3_20260506_ood.ckpt",
         ]
         return cls(
             repo_id="Prior-Labs/tabpfn_3",
@@ -192,32 +203,62 @@ class ModelSource:  # noqa: D101
             filenames=filenames,
         )
 
+    # From v3.5 on, one checkpoint carries both a classification and a regression
+    # head, so there is one source per version rather than one per estimator type.
 
-def _get_model_source(version: ModelVersion, model_type: ModelType) -> ModelSource:  # noqa: PLR0911
-    if version == ModelVersion.V2:
-        if model_type == ModelType.CLASSIFIER:
-            return ModelSource.get_classifier_v2()
-        if model_type == ModelType.REGRESSOR:
-            return ModelSource.get_regressor_v2()
-    elif version == ModelVersion.V2_5:
-        if model_type == ModelType.CLASSIFIER:
-            return ModelSource.get_classifier_v2_5()
-        if model_type == ModelType.REGRESSOR:
-            return ModelSource.get_regressor_v2_5()
-    elif version == ModelVersion.V2_6:
-        if model_type == ModelType.CLASSIFIER:
-            return ModelSource.get_classifier_v2_6()
-        if model_type == ModelType.REGRESSOR:
-            return ModelSource.get_regressor_v2_6()
-    elif version == ModelVersion.V3:
-        if model_type == ModelType.CLASSIFIER:
-            return ModelSource.get_classifier_v3()
-        if model_type == ModelType.REGRESSOR:
-            return ModelSource.get_regressor_v3()
+    @classmethod
+    def get_v3_5(cls) -> ModelSource:  # noqa: D102
+        filenames = [
+            "tabpfn-v3.5-20260909.safetensors",
+            "tabpfn-v3.5-20260909_multiclass.safetensors",
+        ]
+        return cls(
+            repo_id="Prior-Labs/tabpfn_3_5",
+            default_filename="tabpfn-v3.5-20260909.safetensors",
+            filenames=filenames,
+        )
 
-    raise ValueError(
-        f"Unsupported version/model combination: {version.value}/{model_type.value}",
-    )
+    @classmethod
+    def get_v3_5_fast(cls) -> ModelSource:  # noqa: D102
+        # A separate, faster model, not a re-export of `get_v3_5`.
+        filenames = [
+            "tabpfn-v3.5-fast-20260909.safetensors",
+        ]
+        return cls(
+            repo_id="Prior-Labs/tabpfn_3_5",
+            default_filename="tabpfn-v3.5-fast-20260909.safetensors",
+            filenames=filenames,
+        )
+
+
+def _get_model_source(version: ModelVersion, model_type: ModelType) -> ModelSource:
+    sources_by_type: dict[ModelType, Callable[[], ModelSource]] | None = {
+        ModelVersion.V2: {
+            ModelType.CLASSIFIER: ModelSource.get_classifier_v2,
+            ModelType.REGRESSOR: ModelSource.get_regressor_v2,
+        },
+        ModelVersion.V2_5: {
+            ModelType.CLASSIFIER: ModelSource.get_classifier_v2_5,
+            ModelType.REGRESSOR: ModelSource.get_regressor_v2_5,
+        },
+        ModelVersion.V2_6: {
+            ModelType.CLASSIFIER: ModelSource.get_classifier_v2_6,
+            ModelType.REGRESSOR: ModelSource.get_regressor_v2_6,
+        },
+        ModelVersion.V3: {
+            ModelType.CLASSIFIER: ModelSource.get_classifier_v3,
+            ModelType.REGRESSOR: ModelSource.get_regressor_v3,
+        },
+        # From v3.5 on, one multitask checkpoint backs both estimator types.
+        ModelVersion.V3_5: dict.fromkeys(ModelType, ModelSource.get_v3_5),
+        ModelVersion.V3_5_FAST: dict.fromkeys(ModelType, ModelSource.get_v3_5_fast),
+    }.get(version)
+    if sources_by_type is None or model_type not in sources_by_type:
+        raise ValueError(
+            "Unsupported version/model combination: "
+            f"{version.value}/{model_type.value}",
+        )
+    return sources_by_type[model_type]()
 
 
 def _try_huggingface_downloads(
@@ -371,6 +412,7 @@ def _try_direct_downloads(
 def download_all_models(to: Path) -> None:
     """Download all available classifier and regressor models into a local directory."""
     to.mkdir(parents=True, exist_ok=True)
+    first_download_exception: Exception | None = None
     for model_version, model_source, model_type in [
         (ModelVersion.V2, ModelSource.get_classifier_v2(), "classifier"),
         (ModelVersion.V2, ModelSource.get_regressor_v2(), "regressor"),
@@ -380,6 +422,9 @@ def download_all_models(to: Path) -> None:
         (ModelVersion.V2_6, ModelSource.get_regressor_v2_6(), "regressor"),
         (ModelVersion.V3, ModelSource.get_classifier_v3(), "classifier"),
         (ModelVersion.V3, ModelSource.get_regressor_v3(), "regressor"),
+        # One multitask checkpoint per v3.5 version backs both estimator types.
+        (ModelVersion.V3_5, ModelSource.get_v3_5(), "classifier"),
+        (ModelVersion.V3_5_FAST, ModelSource.get_v3_5_fast(), "classifier"),
     ]:
         for ckpt_name in model_source.filenames:
             path = to / ckpt_name
@@ -395,7 +440,16 @@ def download_all_models(to: Path) -> None:
                 model_name=ckpt_name,
             )
             if result != "ok":
-                logger.warning(f"Errors downloading model {model_version}: {result}")
+                for error in result:
+                    logger.error(f"Error downloading model {model_version}: {error}")
+                if first_download_exception is None:
+                    first_download_exception = result[0]
+
+    # We don't immediately raise the exception so we attempt to download every
+    # model, even if some fail.
+    if first_download_exception is not None:
+        msg = "One or more models failed to download"
+        raise RuntimeError(msg) from first_download_exception
 
 
 def _version_has_direct_download_option(version: ModelVersion) -> bool:
@@ -502,6 +556,8 @@ def _download_model(
         ModelVersion.V2_5: "tabpfn_2_5",
         ModelVersion.V2_6: "tabpfn_2_6",
         ModelVersion.V3: "tabpfn_3",
+        ModelVersion.V3_5: "tabpfn_3_5",
+        ModelVersion.V3_5_FAST: "tabpfn_3_5",
     }
     if version in _HF_REPOS:
         try:
@@ -554,7 +610,7 @@ def _download_model(
     return errors
 
 
-P = TypeVar("P", bound=Union[str, list[str]])
+P = TypeVar("P", bound=str | list[str])
 
 
 def prepend_cache_path(model_path: P) -> P:
@@ -574,9 +630,11 @@ def load_model_criterion_config(
     *,
     check_bar_distribution_criterion: Literal[False],
     cache_trainset_representation: bool,
-    version: Literal["v2", "v2.5", "v2.6", "v3"],
-    which: Literal["classifier"],
+    version: Literal["v2", "v2.5", "v2.6", "v3", "v3.5", "v3.5-fast"],
+    estimator_type: Literal["classifier"],
     download_if_not_exists: bool,
+    softmax_temperature_override: float | None = None,
+    n_estimators_override: int | None = None,
 ) -> tuple[
     list[Architecture],
     nn.BCEWithLogitsLoss | nn.CrossEntropyLoss,
@@ -591,9 +649,11 @@ def load_model_criterion_config(
     *,
     check_bar_distribution_criterion: Literal[True],
     cache_trainset_representation: bool,
-    version: Literal["v2", "v2.5", "v2.6", "v3"],
-    which: Literal["regressor"],
+    version: Literal["v2", "v2.5", "v2.6", "v3", "v3.5", "v3.5-fast"],
+    estimator_type: Literal["regressor"],
     download_if_not_exists: bool,
+    softmax_temperature_override: float | None = None,
+    n_estimators_override: int | None = None,
 ) -> tuple[
     list[Architecture],
     FullSupportBarDistribution,
@@ -602,14 +662,16 @@ def load_model_criterion_config(
 ]: ...
 
 
-def load_model_criterion_config(  # noqa: PLR0912
+def load_model_criterion_config(
     model_path: ModelPath | list[ModelPath] | None,
     *,
     check_bar_distribution_criterion: bool,
     cache_trainset_representation: bool,
-    which: Literal["regressor", "classifier"],
-    version: Literal["v2", "v2.5", "v2.6", "v3"],
+    estimator_type: Literal["regressor", "classifier"],
+    version: Literal["v2", "v2.5", "v2.6", "v3", "v3.5", "v3.5-fast"],
     download_if_not_exists: bool,
+    softmax_temperature_override: float | None = None,
+    n_estimators_override: int | None = None,
 ) -> tuple[
     list[Architecture],
     nn.BCEWithLogitsLoss | nn.CrossEntropyLoss | FullSupportBarDistribution,
@@ -619,7 +681,8 @@ def load_model_criterion_config(  # noqa: PLR0912
     """Load the model(s), criterion(s), and config(s) from the given path.
 
     If multiple model paths are provided, then all models must use the same criterion
-    and inference config.
+    and inference config. They may only disagree on a field the caller overrides,
+    which the `*_override` arguments name.
 
     Args:
         model_path: The path to the model, or list of paths if multiple models should be
@@ -630,25 +693,30 @@ def load_model_criterion_config(  # noqa: PLR0912
             for models trained for regression.
         cache_trainset_representation:
             Whether the model should know to cache the trainset representation.
-        which: Whether the model is a regressor or classifier.
+        estimator_type: Whether the model is a regressor or classifier.
         version: The version of the model.
         download_if_not_exists: Whether to download the model if it doesn't exist.
+        softmax_temperature_override: The temperature the caller will apply to every
+            model, or None if they did not ask for one. Only used to decide whether
+            checkpoints are allowed to disagree on their temperature; the override
+            itself is applied by the caller.
+        n_estimators_override: Likewise for the number of estimators.
 
     Returns:
         list of models, the criterion, list of architecture configs, the inference
         config
     """
     model_version = ModelVersion(version)
-    (resolved_model_paths, resolved_model_dirs, resolved_model_names, which) = (
-        resolve_model_path(
-            model_path=model_path,
-            which=which,
-            version=model_version.value,
-        )
+    (
+        resolved_model_paths,
+        resolved_model_dirs,
+        resolved_model_names,
+        estimator_type,
+    ) = resolve_model_path(
+        model_path=model_path,
+        which=estimator_type,
+        version=model_version.value,
     )
-
-    # Anonymously track the model config for usage telemetry
-    _log_model_config(resolved_model_paths, which, model_version)
 
     for folder in resolved_model_dirs:
         folder.mkdir(parents=True, exist_ok=True)
@@ -670,12 +738,12 @@ def load_model_criterion_config(  # noqa: PLR0912
             res = download_model(
                 path,
                 version=model_version,
-                which=cast("Literal['classifier', 'regressor']", which),
+                which=cast("Literal['classifier', 'regressor']", estimator_type),
                 model_name=resolved_model_names[i],
             )
             if res != "ok":
                 if _version_has_direct_download_option(model_version):
-                    repo_type = "clf" if which == "classifier" else "reg"
+                    repo_type = "clf" if estimator_type == "classifier" else "reg"
                     raise RuntimeError(
                         f"Failed to download model to {path}!\n\n"
                         f"For offline usage, please download the model manually from:\n"
@@ -686,18 +754,9 @@ def load_model_criterion_config(  # noqa: PLR0912
 
         loaded_model, criterion, architecture_config, inference_config = load_model(
             path=path,
+            estimator_type=estimator_type,
             cache_trainset_representation=cache_trainset_representation,
         )
-        if criterion is None:
-            if not hasattr(loaded_model, "regression_borders"):
-                # TODO(Phil): Add a a proper Regression API that removes the reliance
-                # on the external criterion and lets the model compute predictions.
-                # Then remove this hack.
-                raise ValueError(
-                    "If no criterion is saved, the model must have "
-                    "a regression_borders attribute."
-                )
-            criterion = FullSupportBarDistribution(loaded_model.regression_borders)
         if check_bar_distribution_criterion and not isinstance(
             criterion,
             FullSupportBarDistribution,
@@ -723,105 +782,43 @@ def load_model_criterion_config(  # noqa: PLR0912
 
     first_inference_config = inference_configs[0]
     for inference_config in inference_configs[1:]:
-        if inference_config != first_inference_config:
+        # A mismatch in an overridable field is reported separately below, as the
+        # user can fix those by naming a value.
+        if not inference_config.equals_ignoring_overridable_fields(
+            first_inference_config
+        ):
             raise ValueError(
                 f"Config 1: {first_inference_config}\n"
                 f"Config 2: {inference_config}\n"
                 "Inference configs for different models are different, which is not "
                 "supported. See above."
             )
+    raise_if_checkpoints_disagree_on_overridable_fields(
+        inference_configs,
+        overrides={
+            "SOFTMAX_TEMPERATURE": softmax_temperature_override,
+            "N_ESTIMATORS": n_estimators_override,
+        },
+    )
 
     return loaded_models, first_criterion, architecture_configs, first_inference_config
-
-
-def _log_model_config(
-    model_paths: list[Path],
-    which: Literal["classifier", "regressor"],
-    version: ModelVersion,
-) -> None:
-    """Set the model config (model_path and model_version) for anonymous
-    usage telemetry.
-
-    Args:
-        model_paths: The path(s) to the model.
-        which: The type of model ('classifier' or 'regressor').
-        version: The model version (currently only 'v2' or 'v2.5').
-    """
-    if len(model_paths) != 1:
-        return
-
-    model_type = ModelType(which)
-    model_source = _get_model_source(version, model_type)
-
-    path: Path = model_paths[0]
-    # Check to avoid that we pass in arbitrary paths containing e.g. PII
-    # Ensure we whitelist model names so that no PII can be released.
-    if path.name in model_source.filenames:
-        set_model_config(path.name, version.value)
-    else:
-        set_model_config("OTHER", version.value)
-
-
-def log_model_init_params(
-    estimator: TabPFNClassifier | TabPFNRegressor, params: dict[str, Any]
-) -> None:
-    """Anonymously model initialization parameters for anonymized
-    usage telemetry.
-
-    At the moment, we only log the `fit_mode` parameter.
-
-    Args:
-        estimator: The TabPFN estimator instance.
-        params: The model initialization parameters.
-    """
-    constructor = getattr(estimator.__class__, "__init__", None)
-    if constructor is None:
-        return
-
-    # Create a validated copy of logged params; avoid passing in arbitrary params
-    # as that would allow for PII leakage
-    logged_params = {}
-
-    signature_params = inspect.signature(constructor).parameters
-    if "fit_mode" in params:
-        param = signature_params.get("fit_mode")
-
-        # Early return, may be replaced in the future when we start tracking
-        # more parameters and validate their types.
-        if not param:
-            return
-
-        annotation = param.annotation
-        # Check if the annotation is a string and the fit_mode is in it.
-        # An alternative may be evaluating the annotation, but this is more secure
-        # because we don't want to execute arbitrary code.
-        fit_mode = str(params["fit_mode"])
-        if isinstance(param.annotation, str) and fit_mode in annotation:
-            logged_params["fit_mode"] = fit_mode
-
-    # Log the logged params
-    if logged_params:
-        try:
-            # We conditionally import here to avoid introducing breaking changes as
-            # this interface was introduced in tabpfn_common_utils 0.2.13 and not all
-            # users have upgraded to this version yet.
-            from tabpfn_common_utils.telemetry import set_init_params  # noqa: PLC0415
-
-            set_init_params(logged_params)
-        except ImportError:
-            pass
 
 
 def _resolve_model_version(model_path: ModelPath | None) -> ModelVersion:
     if model_path is None:
         return settings.tabpfn.model_version
     name = Path(model_path).name
-    if V_2_6_IDENTIFIER in name:
-        return ModelVersion.V2_6
-    if V_2_5_IDENTIFIER in name:
-        return ModelVersion.V2_5
-    if V_3_IDENTIFIER in name:
-        return ModelVersion.V3
+    # Most specific first: "v3.5-fast" contains "v3.5", which contains "v3".
+    identifiers = [
+        (V_3_5_FAST_IDENTIFIER, ModelVersion.V3_5_FAST),
+        (V_3_5_IDENTIFIER, ModelVersion.V3_5),
+        (V_2_6_IDENTIFIER, ModelVersion.V2_6),
+        (V_2_5_IDENTIFIER, ModelVersion.V2_5),
+        (V_3_IDENTIFIER, ModelVersion.V3),
+    ]
+    for identifier, version in identifiers:
+        if identifier in name:
+            return version
     return ModelVersion.V2
 
 
@@ -842,7 +839,7 @@ def resolve_model_version(
 def resolve_model_path(
     model_path: ModelPath | list[ModelPath] | None,
     which: Literal["regressor", "classifier"],
-    version: Literal["v2", "v2.5", "v2.6", "v3"] = "v3",
+    version: Literal["v2", "v2.5", "v2.6", "v3", "v3.5", "v3.5-fast"] = "v3",
 ) -> tuple[
     list[Path],
     list[Path],
@@ -861,7 +858,7 @@ def resolve_model_path(
             interpreted relative to the current working directory. If no file
             exists there, it falls back to the TabPFN cache directory.
         which: The type of model ('regressor' or 'classifier').
-        version: The model version (currently only 'v2').
+        version: The model version, used to pick the default model.
 
     Returns:
         A tuple containing lists of resolved model Path(s),
@@ -894,35 +891,69 @@ def resolve_model_path(
 
 def get_loss_criterion(
     config: ArchitectureConfig,
+    *,
+    estimator_type: Literal["regressor", "classifier"],
+    regression_borders: torch.Tensor | None = None,
 ) -> nn.BCEWithLogitsLoss | nn.CrossEntropyLoss | FullSupportBarDistribution:
     """Create: for classification, a loss function. For regression, a BarDistribution.
 
     The classification loss is only required for training, but we always create it, for
     simplicity. The BarDistribution serves the dual purpose of loss function
     and output distribution, thus is required even during inference.
+
+    The task cannot be read off `config`: a checkpoint that carries both a
+    classification and a regression head has `max_num_classes` set for the
+    classification head, which says nothing about the task the caller wants. Hence
+    `estimator_type`.
+
+    Args:
+        config: The architecture config of the checkpoint.
+        estimator_type: The task the estimator is being built for.
+        regression_borders: Bucket borders for the regression bar distribution.
+            Required when `estimator_type="regressor"`, since the distribution is
+            the model's output and has to use the borders it was trained with -- see
+            `_resolve_regression_borders`.
     """
-    # NOTE: We don't seem to have any of these
-    if config.max_num_classes == 2:
-        return nn.BCEWithLogitsLoss(reduction="none")
+    if estimator_type == "classifier":
+        # NOTE: We don't seem to have any of these
+        if config.max_num_classes == 2:
+            return nn.BCEWithLogitsLoss(reduction="none")
+        if config.max_num_classes > 2:
+            return nn.CrossEntropyLoss(reduction="none")
+        raise ValueError(
+            f"max_num_classes is {config.max_num_classes}, so this checkpoint has no "
+            "classification head and cannot back a classifier."
+        )
 
-    if config.max_num_classes > 2:
-        return nn.CrossEntropyLoss(reduction="none")
-
-    assert config.max_num_classes == 0
-    num_buckets = config.num_buckets
-
-    # NOTE: This just seems to get overriddden in the module loading from `state_dict`
-    # dummy values, extra bad s.t. one realizes if they are used for training
-    borders = torch.arange(num_buckets + 1).float() * 10_000
-    borders = borders * 3  # Used to be `config.get("bucket_scaling", 3)`
-
-    return FullSupportBarDistribution(borders, ignore_nan_targets=True)
+    if regression_borders is None:
+        raise ValueError(
+            "regression_borders is required when estimator_type='regressor'."
+        )
+    return FullSupportBarDistribution(regression_borders, ignore_nan_targets=True)
 
 
-def _file_identity(path: str) -> tuple[int, int]:
-    """Return a cheap identity tuple (mtime_ns, size) for cache-keying."""
-    st = Path(path).stat()
-    return (st.st_mtime_ns, st.st_size)
+def _resolve_regression_borders(
+    *,
+    model: Architecture,
+    criterion_state: dict[str, torch.Tensor],
+    path: Path,
+) -> torch.Tensor:
+    """Bucket borders for the regression bar distribution.
+
+    Checkpoints store them one of two ways, and never both: up to v2.6 as criterion
+    state saved alongside the model, from v3 as a `regression_borders` buffer on the
+    model itself.
+    """
+    if "borders" in criterion_state:
+        return criterion_state["borders"]
+    borders = getattr(model, "regression_borders", None)
+    if borders is None:
+        raise ValueError(
+            f"The model loaded, '{path}', has neither saved criterion borders nor a "
+            "regression_borders buffer, so it cannot produce a regression output "
+            "distribution."
+        )
+    return borders
 
 
 @functools.lru_cache(maxsize=1)
@@ -933,49 +964,116 @@ def _load_checkpoint_cached(path: str, _identity: tuple[int, int]) -> dict:
     *path* is modified.  Use ``_load_checkpoint_cached.cache_clear()`` to
     free memory manually.
     """
-    return _load_checkpoint(path)
+    return Checkpoint(path).load()
 
 
-def _load_checkpoint(path: str) -> dict:
-    """Load a checkpoint from disk."""
-    # Catch the `FutureWarning` that torch raises. This should be dealt with!
-    # The warning is raised due to `torch.load`, which advises against ckpt
-    # files that contain non-tensor data.
-    # This `weights_only=None` is the default value. In the future this will
-    # default to `True`, disallowing loading of arbitrary objects.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=FutureWarning)
-        return torch.load(path, map_location="cpu", weights_only=None)
+# Bounded, opt-in cache of *built* models (architecture + loaded weights),
+# keyed by (resolved path, file identity). Enabled by setting the env var
+# ``TABPFN_MODEL_CACHE_SIZE`` to a positive integer (an LRU of that size;
+# default 0 disables it, preserving prior behaviour). Only the non-mutating
+# build is cached: with ``cache_trainset_representation`` the model accumulates
+# the train-set representation during fit, so a shared instance can't be reused
+# across fits. The cached model is shared by reference and left in ``eval()``
+# mode — intended for repeated sequential fit/predict (cross-validation,
+# per-group models, or servers that manage their own concurrency). RES-2422
+# tracks the follow-up that externalises per-fit state so a single backbone can
+# be shared across threads too.
+_BUILT_MODEL_CACHE: OrderedDict[tuple[str, tuple[int, int]], tuple] = OrderedDict()
+_BUILT_MODEL_CACHE_LOCK = Lock()
+
+
+def _get_built_model_cache_size() -> int:
+    try:
+        return max(0, int(os.environ.get("TABPFN_MODEL_CACHE_SIZE", "0")))
+    except ValueError:
+        return 0
+
+
+def clear_built_model_cache() -> None:
+    """Drop all entries from the built-model cache (see ``TABPFN_MODEL_CACHE_SIZE``)."""
+    with _BUILT_MODEL_CACHE_LOCK:
+        _BUILT_MODEL_CACHE.clear()
 
 
 def load_model(
     *,
     path: Path,
+    estimator_type: Literal["regressor", "classifier"],
     cache_trainset_representation: bool = True,
 ) -> tuple[
     Architecture,
-    nn.BCEWithLogitsLoss | nn.CrossEntropyLoss | FullSupportBarDistribution | None,
+    nn.BCEWithLogitsLoss | nn.CrossEntropyLoss | FullSupportBarDistribution,
     ArchitectureConfig,
     InferenceConfig,
 ]:
     """Loads a model from a given path. Only for inference.
 
-    The raw checkpoint is cached in memory so that repeated calls with the
-    same path skip disk I/O.  The cache is automatically invalidated when
-    the file is modified (detected via mtime and size).
+    The raw checkpoint is cached in memory so repeated calls with the same path
+    skip disk I/O. When ``TABPFN_MODEL_CACHE_SIZE`` is a positive integer the
+    *built* model (architecture + loaded weights) is also cached, as an LRU of
+    that size, so repeated calls skip reconstruction and ``load_state_dict``
+    entirely. Only the non-mutating build (``cache_trainset_representation=False``)
+    is cached. Both caches invalidate when the file changes (mtime + size).
 
     Args:
         path: Path to the checkpoint
+        estimator_type: The task the estimator is being built for. A checkpoint
+            with both heads backs either task, so this selects the criterion.
         cache_trainset_representation: If True, the model will cache the
             trainset representation. Forwarded to get_architecture.
     """
     resolved = str(path.resolve())
-    checkpoint = _load_checkpoint_cached(resolved, _file_identity(resolved))
+    identity = Checkpoint(resolved).identity()
 
-    try:
-        architecture_name = checkpoint["architecture_name"]
-    except KeyError:
-        architecture_name = "base"
+    use_cache = _get_built_model_cache_size() > 0 and not cache_trainset_representation
+    # `estimator_type` belongs in the key: the criterion differs per task, so a
+    # checkpoint built for one task must not be served for the other.
+    key = (resolved, identity, estimator_type)
+    if use_cache:
+        with _BUILT_MODEL_CACHE_LOCK:
+            cached = _BUILT_MODEL_CACHE.get(key)
+            if cached is not None:
+                _BUILT_MODEL_CACHE.move_to_end(key)
+                return cached
+
+    result = _build_model(
+        resolved,
+        identity,
+        estimator_type=estimator_type,
+        cache_trainset_representation=cache_trainset_representation,
+    )
+
+    if use_cache:
+        size = _get_built_model_cache_size()
+        with _BUILT_MODEL_CACHE_LOCK:
+            _BUILT_MODEL_CACHE[key] = result
+            _BUILT_MODEL_CACHE.move_to_end(key)
+            while len(_BUILT_MODEL_CACHE) > size:
+                _BUILT_MODEL_CACHE.popitem(last=False)
+    return result
+
+
+def _build_model(
+    resolved: str,
+    identity: tuple[int, int],
+    *,
+    estimator_type: Literal["regressor", "classifier"],
+    cache_trainset_representation: bool = True,
+) -> tuple[
+    Architecture,
+    nn.BCEWithLogitsLoss | nn.CrossEntropyLoss | FullSupportBarDistribution,
+    ArchitectureConfig,
+    InferenceConfig,
+]:
+    """Build a model from a resolved checkpoint path (no built-model cache)."""
+    checkpoint = _load_checkpoint_cached(resolved, identity)
+
+    # V2 models don't have the "architecture_name" key, V2.5 models have the
+    # architecture name set to "base", so we remap. From V2.6 onwards, the architecture
+    # name corresponds to the python file name.
+    architecture_name = checkpoint.get("architecture_name", "tabpfn_v2")
+    if architecture_name == "base":
+        architecture_name = "tabpfn_v2_5"
     architecture = ARCHITECTURES[architecture_name]
     full_state = checkpoint["state_dict"]
     model_config, unused_model_config = architecture.parse_config(checkpoint["config"])
@@ -988,31 +1086,32 @@ def load_model(
         cache_trainset_representation=cache_trainset_representation,
     )
 
-    if "test_targets_MB" in inspect.signature(model.forward).parameters:
-        # The model computes the loss internally. Strip criterion keys that
-        # save_tabpfn_model may have written so load_state_dict doesn't reject them.
-        model_state = {k: v for k, v in full_state.items() if "criterion." not in k}
-        model.load_state_dict(model_state)
-        model.eval()
-        inference_config = InferenceConfig(
-            **_rename_old_inference_config_keys(checkpoint["inference_config"])
-        )
-        empty_criterion = None
-        return model, empty_criterion, model_config, inference_config
-
+    # A checkpoint may carry criterion state for a task it is not being loaded for
+    # (save_tabpfn_model writes it for regressors), so it is always kept out of the
+    # model's own state and only read when this load is a regression one.
     criterion_state_keys = [k for k in full_state if "criterion." in k]
-    loss_criterion = get_loss_criterion(model_config)
-    if isinstance(loss_criterion, FullSupportBarDistribution):
-        criterion_state = {
-            k.replace("criterion.", ""): full_state[k] for k in criterion_state_keys
-        }
-        loss_criterion.load_state_dict(criterion_state)
-    else:
-        assert len(criterion_state_keys) == 0, criterion_state_keys
-
+    criterion_state = {
+        k.replace("criterion.", ""): full_state[k] for k in criterion_state_keys
+    }
     model_state = {k: v for k, v in full_state.items() if k not in criterion_state_keys}
     model.load_state_dict(model_state)
     model.eval()
+
+    # After load_state_dict, so a regression_borders buffer holds the checkpoint's
+    # borders rather than the ones the architecture initialised itself with.
+    loss_criterion = get_loss_criterion(
+        model_config,
+        estimator_type=estimator_type,
+        regression_borders=(
+            _resolve_regression_borders(
+                model=model, criterion_state=criterion_state, path=Path(resolved)
+            )
+            if estimator_type == "regressor"
+            else None
+        ),
+    )
+    if isinstance(loss_criterion, FullSupportBarDistribution) and criterion_state:
+        loss_criterion.load_state_dict(criterion_state)
     inference_config = _get_inference_config_from_checkpoint(checkpoint, loss_criterion)
     return model, loss_criterion, model_config, inference_config
 
@@ -1028,13 +1127,15 @@ def _get_inference_config_from_checkpoint(
     v2.5 and get the correct config.
     """
     # This is how we tell the checkpoints apart:
-    #     v2: "architecture_name" not present, as added after the v2 release
+    #     v2: "architecture_name" not present, as added after the v2 release.
+    #         New models might specify "tabpfn_v2".
     #   v2.5: "architecture_name" present, but "inference_config" not present
     #  >v2.5: "inference_config" present, so don't need to guess a default config
     if inference_config := checkpoint.get("inference_config"):
         return InferenceConfig(**_rename_old_inference_config_keys(inference_config))
 
-    if "architecture_name" not in checkpoint:
+    architecture_name = checkpoint.get("architecture_name", "tabpfn_v2")
+    if architecture_name == "tabpfn_v2":
         model_version = ModelVersion.V2
     else:
         model_version = ModelVersion.V2_5
@@ -1100,6 +1201,7 @@ def save_tabpfn_model(
         models,
         configs,
         save_paths,
+        strict=True,
     ):
         model_state = ens_model.state_dict()
 
@@ -1127,14 +1229,18 @@ def save_tabpfn_model(
         torch.save(checkpoint, path)
 
 
+def _json_safe_device(device: DevicesSpecification) -> str | list[str]:
+    """Render a device spec for JSON, as `torch.device` is not serializable."""
+    if isinstance(device, (str, torch.device)):
+        return str(device)
+    return [str(d) for d in device]
+
+
 def save_fitted_tabpfn_model(estimator: BaseEstimator, path: Path | str) -> None:
     """Persist a fitted TabPFN estimator to ``path``.
 
     This stores the initialization parameters and the fitted state, but crucially
     omits the large foundation model weights for efficiency.
-
-    This does not support estimators using `fit_mode="fit_with_cache"`, and will raise
-    NotImplementedError in this case.
     """
     if not hasattr(estimator, "executor_"):
         raise RuntimeError("Estimator must be fitted before saving.")
@@ -1154,6 +1260,7 @@ def save_fitted_tabpfn_model(estimator: BaseEstimator, path: Path | str) -> None
         params = {
             k: (str(v) if isinstance(v, torch.dtype) else v) for k, v in params.items()
         }
+        params["device"] = _json_safe_device(params["device"])
         params["__class_name__"] = estimator.__class__.__name__
         with (tmp / "init_params.json").open("w") as f:
             json.dump(params, f)
@@ -1167,8 +1274,12 @@ def save_fitted_tabpfn_model(estimator: BaseEstimator, path: Path | str) -> None
         # move all tensors to "cpu" before saving, so if fitted & saved on cuda-device
         # and loading on cpu-device does not throw
         # "RuntimeError: Attempting to deserialize object on a CUDA device..."
+        # Tensor.to returns a copy, but nn.Module.to moves in place, so modules
+        # must be deep-copied to leave the live estimator on its device.
         fitted_attrs = {
-            k: v.to("cpu") if isinstance(v, (torch.nn.Module, torch.Tensor)) else v
+            k: copy.deepcopy(v).to("cpu")
+            if isinstance(v, torch.nn.Module)
+            else (v.to("cpu") if isinstance(v, torch.Tensor) else v)
             for k, v in fitted_attrs.items()
         }
 
@@ -1180,8 +1291,11 @@ def save_fitted_tabpfn_model(estimator: BaseEstimator, path: Path | str) -> None
         )
 
         # 4. Create the final zip archive
-        shutil.make_archive(str(path).replace(".tabpfn_fit", ""), "zip", tmp)
-        shutil.move(str(path).replace(".tabpfn_fit", "") + ".zip", path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as archive_tmpdir:
+            archive_base = Path(archive_tmpdir) / "archive"
+            archive_path = shutil.make_archive(str(archive_base), "zip", tmp)
+            shutil.move(archive_path, path)
 
 
 def _extract_archive(path: Path, tmp: Path) -> None:
@@ -1194,9 +1308,16 @@ def _extract_archive(path: Path, tmp: Path) -> None:
 
 
 def load_fitted_tabpfn_model(
-    path: Path | str, *, device: str | torch.device = "cpu"
+    path: Path | str, *, device: DevicesSpecification = "auto"
 ) -> BaseEstimator:
-    """Load a fitted TabPFN estimator saved with ``save_fitted_tabpfn_model``."""
+    """Load a fitted TabPFN estimator saved with ``save_fitted_tabpfn_model``.
+
+    Args:
+        path: The ``.tabpfn_fit`` archive to load.
+        device: The device(s) to load onto. The archive does not record where the
+            model was fitted, so the default resolves by availability like the
+            constructors' does; pass a device to pin it.
+    """
     path = Path(path)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -1213,7 +1334,7 @@ def load_fitted_tabpfn_model(
         ].startswith("torch."):
             dtype_name = params["inference_precision"].split(".")[1]
             params["inference_precision"] = getattr(torch, dtype_name)
-        params["device"] = str(device)
+        params["device"] = device
 
         if saved_cls_name == "TabPFNClassifier":
             cls = import_module("tabpfn.classifier").TabPFNClassifier
@@ -1235,21 +1356,27 @@ def load_fitted_tabpfn_model(
             tmp / "executor_state.joblib", est.models_
         )
 
-        est.to(str(device))
+        est.to(device)
 
         return est
 
 
 def _resolve_architecture_name(config: ArchitectureConfig) -> str:
     """Resolve the architecture name from the config."""
+    from tabpfn.architectures.tabpfn_v2 import TabPFNV2Config  # noqa: PLC0415
     from tabpfn.architectures.tabpfn_v2_5 import TabPFNV2p5Config  # noqa: PLC0415
     from tabpfn.architectures.tabpfn_v2_6 import TabPFNV2p6Config  # noqa: PLC0415
     from tabpfn.architectures.tabpfn_v3 import TabPFNV3Config  # noqa: PLC0415
+    from tabpfn.architectures.tabpfn_v3_5 import TabPFNV3p5Config  # noqa: PLC0415
 
+    if isinstance(config, TabPFNV3p5Config):
+        return "tabpfn_v3_5"
     if isinstance(config, TabPFNV3Config):
         return "tabpfn_v3"
     if isinstance(config, TabPFNV2p6Config):
         return "tabpfn_v2_6"
     if isinstance(config, TabPFNV2p5Config):
         return "tabpfn_v2_5"
-    return "base"
+    if isinstance(config, TabPFNV2Config):
+        return "tabpfn_v2"
+    return "tabpfn_v2"

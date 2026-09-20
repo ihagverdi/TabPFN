@@ -35,7 +35,7 @@ class TabPFNSettings(BaseSettings):
         "If not set, uses platform-specific user cache directory.",
     )
     model_version: ModelVersion = Field(
-        default=ModelVersion.V3,
+        default=ModelVersion.V3_5,
         description="The version of the TabPFN model to use by default.",
     )
 
@@ -52,7 +52,7 @@ class TabPFNSettings(BaseSettings):
     # Performance/Memory Settings
     allow_cpu_large_dataset: bool = Field(
         default=False,
-        description="Allow running TabPFN on CPU with large datasets (>1000 samples). "
+        description="Allow running TabPFN on CPU with large datasets. "
         "Set to True to override the CPU limitation.",
     )
     mps_memory_fraction: float = Field(
@@ -60,6 +60,14 @@ class TabPFNSettings(BaseSettings):
         description="Fraction of recommended max MPS memory to allow (0.0 to 2.0). "
         "Used to prevent macOS system crashes on Apple Silicon. "
         "Values > 1.0 are not recommended.",
+    )
+    max_batched_test_rows: int = Field(
+        default=32768,
+        ge=0,
+        description="Maximum number of test rows fed through the model in a single "
+        "forward pass during cached ('fit_with_cache') inference. Larger test sets "
+        "are chunked. Performance is close to optimal at the default of 32768. "
+        "Set to 0 to disable chunking.",
     )
 
     def model_post_init(self, _: Any) -> None:

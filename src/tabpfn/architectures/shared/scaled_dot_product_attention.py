@@ -3,16 +3,73 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Literal
+
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.torch_version import TorchVersion
 
-from tabpfn.architectures.shared.attention_gqa_check import gqa_is_supported
-from tabpfn.architectures.shared.fa3_backend import fa3_attn_func, is_fa3_preferred
-from tabpfn.architectures.shared.mlx_backend import (
-    flash_attention_mlx,
-    is_mlx_preferred,
+from tabpfn.architectures.shared.attention_backends import (
+    find_attention_backend,
+    register_attention_backend,
 )
+from tabpfn.architectures.shared.attention_gqa_check import gqa_is_supported
+from tabpfn.architectures.shared.fa3_backend import FA3_BACKEND
+from tabpfn.architectures.shared.mlx_backend import MLX_BACKEND
+from tabpfn.architectures.shared.torch_mps_backend import TORCH_MPS_BACKEND
+
+if TYPE_CHECKING:
+    from tabpfn.architectures.kv_cache import QuantizedKVCacheEntry
+    from tabpfn.architectures.shared.attention_backends import AttentionBackend
+
+register_attention_backend(
+    # Listed in consult order: the first one that prefers a call takes it.
+    # Backends whose dependency is missing are left out entirely.
+    *(
+        backend
+        for backend in (FA3_BACKEND, TORCH_MPS_BACKEND, MLX_BACKEND)
+        if backend.is_available()
+    )
+)
+
+
+def scaled_dot_product_attention(
+    q_BSHD: torch.Tensor,
+    k_BSJD: torch.Tensor | None,
+    v_BSJD: torch.Tensor | None,
+    _backends_override: list[SDPBackend] | None = None,
+    *,
+    quantized_kv: QuantizedKVCacheEntry | None = None,
+    backend: AttentionBackend | None | Literal["auto"] = "auto",
+) -> torch.Tensor:
+    """Attention dispatch: run a registered backend, or the torch SDPA path.
+
+    The backend is resolved from the shapes of this call (the default
+    ``backend="auto"``); pass a backend to run it without consulting the
+    registry, or ``None`` to force the standard SDPA path.
+
+    ``quantized_kv`` supplies the keys/values as a quantized cache entry
+    instead of ``k_BSJD``/``v_BSJD``.
+
+    Dequantization happens exactly once, here: whoever takes the call
+    receives dense ``k``/``v`` — unless it is a backend declaring
+    ``consumes_quantized_kv = True``, which receives the entry as stored.
+    """
+    if isinstance(backend, str):  # "auto"
+        backend = find_attention_backend(
+            q_BSHD, k_BSJD, v_BSJD, quantized_kv=quantized_kv
+        )
+
+    if quantized_kv is not None and not (
+        backend is not None and getattr(backend, "consumes_quantized_kv", False)
+    ):
+        entry = quantized_kv.dequantize(q_BSHD.dtype)
+        k_BSJD, v_BSJD = entry.key, entry.value
+        quantized_kv = None
+
+    if backend is not None:
+        return backend.run(q_BSHD, k_BSJD, v_BSJD, quantized_kv=quantized_kv)
+    return _torch_sdpa(q_BSHD, k_BSJD, v_BSJD, _backends_override)
+
 
 # MATH is the reference implementation. Keeping it as a final fallback
 # avoids "No available kernel" errors on GPUs where none of the fast
@@ -27,86 +84,65 @@ _SDPA_BACKENDS = [
 ]
 
 
-def is_torch_mps_preferred(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
-    """True iff PyTorch's MPS SDPA is preferred for this attention call."""
-    _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-    return (
-        # Torch added support for flash attention after 2.13.0.dev20260510. Note that
-        torch.__version__ >= TorchVersion("2.13.0.dev20260510")
-        and (q.is_mps and k.is_mps and v.is_mps)
-        and (q.dtype in _DTYPES and k.dtype in _DTYPES and v.dtype in _DTYPES)
-    )
+# A FlashAttention backward fails with "CUDA error: an illegal memory access was
+# encountered" once
+# ``batch * heads * round_up(seq_q, 128) * max(head_dim, 32) > 2**31``.
+# The forward is fine at the same shapes, and the memory-efficient backend is
+# fine at all of them. Note that the kernel pads internally, so we round to
+# query_block and min_head_dim sizes.
+_FLASH_BACKWARD_MAX_ELEMENTS = 2**31
+_FLASH_QUERY_BLOCK = 128
+_FLASH_MIN_HEAD_DIM = 32
 
 
-def torch_mps_sdpa(
+def _flash_backward_num_iterations(
+    q_BHSD: torch.Tensor,
+    num_q_heads: int,
+    backends: list[SDPBackend],
+) -> int:
+    """Batch chunks needed to keep each call inside FlashAttention's index range.
+
+    Returns 1 when FlashAttention cannot be selected, or when a single batch
+    entry already exceeds the range and chunking the batch therefore cannot help.
+    """
+    if SDPBackend.FLASH_ATTENTION not in backends:
+        return 1
+    block = _FLASH_QUERY_BLOCK
+    padded_seq = ((q_BHSD.shape[-2] + block - 1) // block) * block
+    padded_head_dim = max(q_BHSD.shape[-1], _FLASH_MIN_HEAD_DIM)
+    elements_per_batch_entry = num_q_heads * padded_seq * padded_head_dim
+    max_sub_batch = _FLASH_BACKWARD_MAX_ELEMENTS // elements_per_batch_entry
+    if max_sub_batch < 1:
+        return 1
+    return (q_BHSD.shape[0] + max_sub_batch - 1) // max_sub_batch
+
+
+def _torch_sdpa(
     q_BSHD: torch.Tensor,
-    k_BJSD: torch.Tensor,
-    v_BJSD: torch.Tensor,
-    *,
-    enable_gqa: bool = False,
-) -> torch.Tensor:
-    """SDPA with head dim padded to the nearest MPS-supported dim."""
-    supported_dims = [32, 64, 96, 128, 256]
-    head_dim = q_BSHD.shape[-1]
-    target_dim = min((d for d in supported_dims if d >= head_dim), default=head_dim)
-    pad_width = target_dim - head_dim
-    if pad_width > 0:
-        q_BSHD = torch.nn.functional.pad(q_BSHD, (0, pad_width))
-        k_BJSD = torch.nn.functional.pad(k_BJSD, (0, pad_width))
-        v_BJSD = torch.nn.functional.pad(v_BJSD, (0, pad_width))
-    out = torch.nn.functional.scaled_dot_product_attention(
-        q_BSHD,
-        k_BJSD,
-        v_BJSD,
-        attn_mask=None,
-        enable_gqa=enable_gqa,
-        scale=head_dim**-0.5,
-    )
-    if pad_width > 0:
-        out = out[..., :head_dim]
-    return out
-
-
-def scaled_dot_product_attention(
-    q_BSHD: torch.Tensor,
-    k_BSJD: torch.Tensor,
-    v_BSJD: torch.Tensor,
+    k_BSJD: torch.Tensor | None,
+    v_BSJD: torch.Tensor | None,
     _backends_override: list[SDPBackend] | None = None,
 ) -> torch.Tensor:
-    """Scaled dot-product, optimized for various scenarios.
+    """The standard path: torch SDPA, hardened for tabpfn's shapes.
 
-    This is a more robust and potentially faster version of
-    torch.nn.functional.scaled_dot_product_attention.
-
-    Specifically, it
-    - works around very large batch size errors
-    - supports and auto selects the following additional backends if present:
-        - FA3 (Hopper GPUs, fp16/bf16)
-        - MLX flash attention (MPS)
+    A more robust version of torch.nn.functional.scaled_dot_product_attention:
+    enables GQA where needed, and works around the
+    CUDA maximum grid size for very large ``batch * heads`` (pytorch #142228)
+    and FlashAttention's 32-bit backward indexing
+    (see ``_flash_backward_num_iterations``) by chunking the batch.
     """
     msg = "SDPA expects (B, S, H, D); got tensor of shape"
     assert q_BSHD.dim() == 4, f"{msg} q:{tuple(q_BSHD.shape)}"
+    assert k_BSJD is not None
+    assert v_BSJD is not None
     assert k_BSJD.dim() == 4, f"{msg} k:{tuple(k_BSJD.shape)}"
     assert v_BSJD.dim() == 4, f"{msg} v:{tuple(v_BSJD.shape)}"
-
-    if is_fa3_preferred(q_BSHD, k_BSJD):
-        return fa3_attn_func(
-            q_BSHD.contiguous(), k_BSJD.contiguous(), v_BSJD.contiguous()
-        )
 
     q_BHSD = q_BSHD.permute(0, 2, 1, 3)
     k_BJSD = k_BSJD.permute(0, 2, 1, 3)
     v_BJSD = v_BSJD.permute(0, 2, 1, 3)
     num_q_heads = q_BHSD.shape[-3]
     num_kv_heads = k_BJSD.shape[-3]
-
-    if is_torch_mps_preferred(q_BHSD, k_BJSD, v_BJSD):
-        return torch_mps_sdpa(
-            q_BHSD, k_BJSD, v_BJSD, enable_gqa=(num_q_heads == num_kv_heads)
-        ).permute(0, 2, 1, 3)
-    if is_mlx_preferred(q_BHSD, k_BJSD, v_BJSD):
-        # Note: MLX supports GQA and doesn't seem to have a max grid batch size issue.
-        return flash_attention_mlx(q_BHSD, k_BJSD, v_BJSD).permute(0, 2, 1, 3)
 
     dtype_supports_gqa = q_BHSD.dtype in {torch.float16, torch.bfloat16}
     if num_q_heads == num_kv_heads:
@@ -126,10 +162,20 @@ def scaled_dot_product_attention(
     backends = _backends_override if _backends_override is not None else _SDPA_BACKENDS
 
     num_parallel_calls = q_BHSD.shape[:2].numel()
-    torch._check(num_parallel_calls >= 1)  # These checks help torch.compile.
-    torch._check(q_BHSD.shape[0] >= 1)
+    if torch.compiler.is_compiling():
+        torch._check(num_parallel_calls >= 1)  # These checks help torch.compile.
+        torch._check(q_BHSD.shape[0] >= 1)
     CUDA_MAX_GRID = 65536
     num_iterations = (num_parallel_calls + CUDA_MAX_GRID - 1) // CUDA_MAX_GRID
+    needs_sdpa_backward = torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in (q_BHSD, keys, values)
+    )
+
+    if needs_sdpa_backward:
+        num_iterations = max(
+            num_iterations,
+            _flash_backward_num_iterations(q_BHSD, num_q_heads, backends),
+        )
     sub_batch = (q_BHSD.shape[0] + num_iterations - 1) // num_iterations
 
     with sdpa_kernel(backends=backends):

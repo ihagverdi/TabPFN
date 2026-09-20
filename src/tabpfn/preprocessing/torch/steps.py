@@ -36,10 +36,17 @@ from tabpfn.utils import infer_random_state
 class TorchQuantileTransformerStep(TorchPreprocessingStep):
     """Pipeline step wrapper for TorchQuantileTransformer."""
 
-    def __init__(self, n_quantiles: int = 1_000) -> None:
+    def __init__(
+        self,
+        n_quantiles: int = 1_000,
+        extrapolate_ratio: float | None = None,
+    ) -> None:
         """Initialize the quantile transformer step."""
         super().__init__()
-        self._quantile_transformer = TorchQuantileTransformer(n_quantiles=n_quantiles)
+        self._quantile_transformer = TorchQuantileTransformer(
+            n_quantiles=n_quantiles,
+            extrapolate_ratio=extrapolate_ratio,
+        )
 
     @override
     def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -151,9 +158,13 @@ class TorchSelectiveQuantileTransformerStep(TorchPreprocessingStep):
         self,
         n_quantiles: int,
         target_column_indices: list[int],
+        extrapolate_ratio: float | None = None,
     ) -> None:
         super().__init__()
-        self._qt = TorchQuantileTransformer(n_quantiles=n_quantiles)
+        self._qt = TorchQuantileTransformer(
+            n_quantiles=n_quantiles,
+            extrapolate_ratio=extrapolate_ratio,
+        )
         self._target_column_indices = target_column_indices
 
     @override
@@ -359,6 +370,7 @@ class TorchAddSVDFeaturesStep(TorchPreprocessingStep):
     def __init__(
         self,
         global_transformer_name: Literal["svd", "svd_quarter_components"] = "svd",
+        random_state: int | np.random.Generator | None = None,
     ) -> None:
         """Initialize the SVD features step.
 
@@ -366,11 +378,18 @@ class TorchAddSVDFeaturesStep(TorchPreprocessingStep):
             global_transformer_name: Name of the SVD variant. The number of
                 components is computed inside ``_fit`` via
                 :func:`get_svd_n_components`, matching the CPU pipeline.
+            random_state: Seeds the SVD's random projection, as in the CPU
+                :class:`AddSVDFeaturesStep`.
         """
         super().__init__()
         self.global_transformer_name = global_transformer_name
+        self.random_state = random_state
         self._scaler = TorchSafeStandardScaler()
         self._svd: TorchTruncatedSVD | None = None
+
+    @override
+    def added_feature_prefix(self) -> str:
+        return "svd"
 
     @override
     def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -385,13 +404,22 @@ class TorchAddSVDFeaturesStep(TorchPreprocessingStep):
         num_train_rows = x.shape[0]
         num_features = x.shape[-1]
 
+        # Mirror the CPU AddSVDFeaturesStep, which is a no-op for fewer than
+        # 2 features (TruncatedSVD needs n_components < n_features).
+        if num_features < 2:
+            return {"is_no_op": torch.tensor(data=True)}
+
         effective_n_components = get_svd_n_components(
             self.global_transformer_name,
             n_samples=num_train_rows,
             n_features=num_features,
         )
 
-        self._svd = TorchTruncatedSVD(n_components=effective_n_components)
+        static_seed, _ = infer_random_state(self.random_state)
+        self._svd = TorchTruncatedSVD(
+            n_components=effective_n_components,
+            random_state=static_seed,
+        )
 
         # Fit scaler on training data (flatten batch dimension for fitting)
         # Shape: [num_train_rows, batch_size, num_cols] -> flattened
@@ -426,6 +454,9 @@ class TorchAddSVDFeaturesStep(TorchPreprocessingStep):
         Returns:
             Tuple of (original_columns, svd_features, NUMERICAL modality).
         """
+        if "is_no_op" in fitted_cache:
+            return x, None, None
+
         num_rows, batch_size, num_features = x.shape
 
         # Extract caches
@@ -469,6 +500,10 @@ class TorchAddFingerprintFeaturesStep(TorchPreprocessingStep):
 
     TODO: Implement this on GPU natively.
     """
+
+    @override
+    def added_feature_prefix(self) -> str:
+        return "fingerprint"
 
     @override
     def fit_transform(
